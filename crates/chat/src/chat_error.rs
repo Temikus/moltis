@@ -100,6 +100,23 @@ fn try_parse_known_error(raw: &str) -> Value {
             );
         }
 
+        // Upstream provider error (e.g. OpenRouter forwarding an error from its
+        // underlying provider for a specific model).  This is a per-model transient
+        // failure, not a credential problem.
+        if let Some(msg) = err_obj.get("message").and_then(|v| v.as_str())
+            && is_upstream_provider_error_message(msg)
+        {
+            return build_error(
+                "upstream_provider_error",
+                "\u{26A0}\u{FE0F}",
+                "Upstream provider error",
+                msg,
+                None,
+                None,
+                None,
+            );
+        }
+
         // Generic JSON error with a message field
         if let Some(msg) = err_obj.get("message").and_then(|v| v.as_str()) {
             return build_error(
@@ -228,6 +245,16 @@ fn is_unsupported_model_message(message: &str) -> bool {
         || lower.contains("only supported in v1/responses")
         || lower.contains("v1/chat/completions");
     has_model && unsupported
+}
+
+/// Returns `true` when `message` indicates that an aggregating provider (e.g.
+/// OpenRouter) is relaying an error from the _upstream_ model provider rather
+/// than signalling a credential or billing problem with the caller's own key.
+fn is_upstream_provider_error_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.starts_with("provider returned error")
+        || lower.starts_with("provider error:")
+        || lower.starts_with("upstream provider returned")
 }
 
 fn matches_type_or_message(obj: &Value, type_str: &str, message_substr: &str) -> bool {
@@ -418,6 +445,10 @@ fn translation_keys_for(error_type: &str) -> (Option<&'static str>, Option<&'sta
             Some("errors:chat.billingExhausted.detail"),
         ),
         "api_error" | "unknown" => (Some("errors:generic.title"), None),
+        "upstream_provider_error" => (
+            Some("errors:chat.serverError.title"),
+            Some("errors:chat.serverError.detail"),
+        ),
         _ => (None, None),
     }
 }
@@ -609,5 +640,31 @@ mod tests {
         let result = parse_chat_error(raw, Some("openai"));
         assert_eq!(result["type"], "unsupported_model");
         assert_eq!(result["provider"], "openai");
+    }
+
+    #[test]
+    fn test_openrouter_upstream_provider_error_json() {
+        // OpenRouter forwards errors from its upstream providers with this format.
+        let raw =
+            r#"openrouter API error: {"error":{"message":"Provider returned error: service temporarily unavailable"}}"#;
+        let result = parse_chat_error(raw, Some("openrouter"));
+        assert_eq!(result["type"], "upstream_provider_error");
+        assert_eq!(result["title"], "Upstream provider error");
+        assert_eq!(result["provider"], "openrouter");
+    }
+
+    #[test]
+    fn test_openrouter_upstream_provider_error_variants() {
+        let cases = [
+            r#"{"error":{"message":"Provider returned error: service unavailable"}}"#,
+            r#"{"error":{"message":"provider returned error: 503 from upstream"}}"#,
+        ];
+        for raw in &cases {
+            let result = parse_chat_error(raw, None);
+            assert_eq!(
+                result["type"], "upstream_provider_error",
+                "expected upstream_provider_error for: {raw}"
+            );
+        }
     }
 }

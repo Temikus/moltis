@@ -2444,8 +2444,17 @@ impl ProviderSetupService for LiveProviderSetupService {
                         .and_then(|v| v.as_str())
                         .unwrap_or(&error_text)
                         .to_string();
-                    let is_unsupported =
-                        error_obj.get("type").and_then(|v| v.as_str()) == Some("unsupported_model");
+                    let error_type =
+                        error_obj.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    let is_unsupported = error_type == "unsupported_model";
+                    // Transient per-model errors from aggregating providers (e.g.
+                    // OpenRouter relaying an upstream provider failure or rate limit).
+                    // These do not indicate invalid credentials — skip and try the
+                    // next candidate model.
+                    let is_transient_upstream = matches!(
+                        error_type,
+                        "upstream_provider_error" | "server_error" | "rate_limit_exceeded"
+                    );
                     let elapsed_ms = probe_started.elapsed().as_millis();
                     info!(
                         provider = %validation_provider_name,
@@ -2470,6 +2479,10 @@ impl ProviderSetupService for LiveProviderSetupService {
                     .await;
                     if is_unsupported {
                         unsupported_errors.push(detail);
+                        continue;
+                    }
+                    if is_transient_upstream {
+                        last_error = Some(detail);
                         continue;
                     }
                     last_error = Some(detail);
@@ -4124,6 +4137,109 @@ mod tests {
             models
                 .iter()
                 .any(|m| m.get("id").and_then(|v| v.as_str()) == Some("ollama::llama3.2"))
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_key_skips_upstream_provider_errors_and_succeeds() {
+        // Verify that when one model probe returns a transient upstream-provider
+        // error, validation continues and succeeds on the next model.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        use axum::{
+            Extension, Json, Router,
+            http::StatusCode,
+            routing::post,
+        };
+
+        let call_count = StdArc::new(AtomicUsize::new(0));
+        let call_count_clone = StdArc::clone(&call_count);
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(
+                    |Extension(counter): Extension<StdArc<AtomicUsize>>| async move {
+                        let n = counter.fetch_add(1, Ordering::SeqCst);
+                        if n == 0 {
+                            // First probe: simulate an upstream provider error
+                            // via a real HTTP error status so the provider throws.
+                            (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(serde_json::json!({
+                                    "error": {
+                                        "message": "Provider returned error: service temporarily unavailable"
+                                    }
+                                })),
+                            )
+                        } else {
+                            // Subsequent probes: success.
+                            (
+                                StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "choices": [{"message": {"content": "pong"}}],
+                                    "usage": {
+                                        "prompt_tokens": 1,
+                                        "completion_tokens": 1,
+                                        "prompt_tokens_details": {"cached_tokens": 0}
+                                    }
+                                })),
+                            )
+                        }
+                    },
+                ),
+            )
+            .layer(Extension(call_count_clone));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let registry = Arc::new(RwLock::new(ProviderRegistry::from_env_with_config(
+            &ProvidersConfig::default(),
+        )));
+        // Inject an error parser matching production behaviour: a 5xx HTTP
+        // status is classified as `server_error` (same as parse_chat_error).
+        fn parse_upstream_error(raw: &str, _provider: Option<&str>) -> Value {
+            let lower = raw.to_ascii_lowercase();
+            if lower.contains("503")
+                || lower.contains("service unavailable")
+                || lower.contains("provider returned error")
+            {
+                return serde_json::json!({"type": "server_error", "detail": raw});
+            }
+            serde_json::json!({"type": "unknown", "detail": raw})
+        }
+        let svc = LiveProviderSetupService::new(registry, ProvidersConfig::default(), None)
+            .with_error_parser(parse_upstream_error);
+        let result = svc
+            .validate_key(serde_json::json!({
+                "provider": "openai",
+                "apiKey": "sk-test",
+                // OpenAI-compatible providers append /chat/completions to the
+                // base URL, so include the /v1 path component.
+                "baseUrl": format!("http://{addr}/v1"),
+                // Supply two models so the first error is skippable and the
+                // second probe can succeed.
+                "models": ["gpt-4o-mini", "gpt-4o"]
+            }))
+            .await
+            .expect("validate_key should return payload");
+        server.abort();
+
+        assert_eq!(
+            result.get("valid").and_then(|v| v.as_bool()),
+            Some(true),
+            "validation should succeed after skipping the upstream provider error: {result}"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "exactly 2 probes expected: one skipped error + one success"
         );
     }
 
